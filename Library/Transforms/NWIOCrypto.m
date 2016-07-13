@@ -24,6 +24,17 @@ static NSString * const NWIOStatusKey = @"status";
 
 // TODO: feed encryption as much bytes as output can handle, instead of asserting on CCCryptorGetOutputLength
 
+
+@interface NWIOCryptoTransform ()
+
+@property (nonatomic) unsigned char * leftOverBuffer;
+@property (nonatomic) size_t leftOverSize;
+
+
+@end
+
+
+
 @implementation NWIOCryptoTransform {
     CCCryptorRef backwardCryptor;
     CCCryptorRef forwardCryptor;
@@ -34,9 +45,21 @@ static NSString * const NWIOStatusKey = @"status";
 
 #pragma mark - Object life cycle
 
+- (instancetype) init {
+    self = [super init];
+    if(self) {
+        self.leftOverBuffer = 0;
+        return self;
+    }
+    
+    return self;
+}
+
 - (void)dealloc {
     [self resetBackward];
     [self resetForward];
+    
+    free(self.leftOverBuffer);
 }
 
 
@@ -50,39 +73,134 @@ static NSString * const NWIOStatusKey = @"status";
 
 #pragma mark - NWIOTransform subclass
 
-// TODO: add support for zero (NULL) buffers, like in NWIODeflate
+
+- (NSUInteger) calculateRequiredInputBuffer:(CCCryptorRef*) ref inputLen:(NSUInteger *) inputLen toLength:(NSUInteger) toLength {
+    NSUInteger res = 0;
+    NSUInteger inputLength = toLength - 1;
+    while(res < toLength) {
+        res = CCCryptorGetOutputLength(*ref, ++inputLength, false);
+    }
+    
+    *inputLen = inputLength;
+    return res;
+}
+
+- (unsigned char *) consumeLeftovers:(unsigned char *) toBuffer length:(NSUInteger *) toLen {
+    if(self.leftOverBuffer == nil) {
+        return toBuffer;
+    }
+    
+    size_t destinationSize = MIN(self.leftOverSize, *toLen);
+    memcpy(toBuffer, self.leftOverBuffer, destinationSize);
+    
+    *toLen -= destinationSize;
+    unsigned char * newBufferPtr = toBuffer + destinationSize;
+
+    if(self.leftOverSize > destinationSize) {
+        // We still have some leftovers, to let's copy them to the new place
+        size_t newLeftoversize = self.leftOverSize - destinationSize;
+        unsigned char * newLeftovers = malloc(newLeftoversize);
+        
+        memcpy(newLeftovers, (self.leftOverBuffer + destinationSize), newLeftoversize); // Get some new leftovers
+        free(self.leftOverBuffer); // Free the old space
+        
+        self.leftOverBuffer = newLeftovers;
+        self.leftOverSize = newLeftoversize;
+    } else {
+        free(self.leftOverBuffer); // Throw away the old leftovers (that have already been copied to the destination)
+        self.leftOverBuffer = 0;
+        self.leftOverSize = 0;
+    }
+    
+    return newBufferPtr;
+}
+
+- (void) saveLeftovers:(unsigned char *) toBuffer fromLen:(size_t) fromLen toLen:(size_t) toLen {
+    assert(self.leftOverBuffer == 0);
+    
+    size_t leftOverSize = fromLen - toLen;
+    
+    if(leftOverSize > 0) {
+        self.leftOverBuffer = malloc(leftOverSize);
+        memcpy(self.leftOverBuffer, toBuffer, leftOverSize);
+        self.leftOverSize  = leftOverSize;
+    }
+}
 
 // turns zip into bytes (inflate)
 - (BOOL)transformBackwardFromBuffer:(const unsigned char *)fromBuffer fromLength:(NSUInteger)fromLength fromInc:(NSUInteger *)fromInc toBuffer:(unsigned char *)toBuffer toLength:(NSUInteger)toLength toInc:(NSUInteger *)toInc error:(NSError **)error {
+    unsigned char * tmpBuffer = 0;
+    unsigned char * buffer = 0;
+    BOOL retValue = NO;
+    
+    if(toLength == 0) {
+        retValue = YES;
+        goto finally;
+        return YES;
+    }
+    
+    // Sometimes we are given nil in the toBuffer (for example when seeking in an encrypted file),
+    // We'll create a tmpBuffer that we can decrypt into because CCCryptorUpdate does not
+    // respond well to nil output
+    if(toBuffer == nil) {
+        tmpBuffer = malloc(toLength * sizeof(unsigned char));
+        toBuffer = tmpBuffer;
+    }
+    
     if (!backwardCryptor) {
-        unsigned char keyBuffer[kCCKeySizeAES128];
+        unsigned char keyBuffer[[key length]];
         memset(keyBuffer, 0, sizeof(keyBuffer));
         memcpy(keyBuffer, key.bytes, key.length < sizeof(keyBuffer) ? key.length : sizeof(keyBuffer));
-        unsigned char ivBuffer[kCCBlockSizeAES128];
+        unsigned char ivBuffer[[iv length]];
         memset(ivBuffer, 0, sizeof(ivBuffer));
         memcpy(ivBuffer, iv.bytes, iv.length < sizeof(ivBuffer) ? iv.length : sizeof(ivBuffer));
-        CCCryptorStatus status = CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, keyBuffer, kCCKeySizeAES128, ivBuffer, &backwardCryptor);
+        CCCryptorStatus status = CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, keyBuffer, [key length], ivBuffer, &backwardCryptor);
         if (status != kCCSuccess) {
             if (error) {
                 *error = [self errorForStatus:status];
             }
             backwardCryptor = NULL;
-            return NO;
+
+            goto finally;
         }
     }
-    NSAssert(CCCryptorGetOutputLength(backwardCryptor, fromLength, false) <= toLength, @"Should out fit: %i<=%i", CCCryptorGetOutputLength(backwardCryptor, fromLength, false), toLength);
+    
+    NSUInteger originalToLength = toLength;
+    unsigned char * remainingBuffer = [self consumeLeftovers:toBuffer length:&toLength];
+    
+    NSUInteger inputLen = 0;
+    NSUInteger requiredLength = [self calculateRequiredInputBuffer:&backwardCryptor inputLen:&inputLen toLength:toLength];
+    inputLen = MIN(inputLen, fromLength);
+    
+    unsigned char * destinationBuffer = 0;
+    if(requiredLength > toLength) {
+        buffer = malloc(requiredLength * sizeof(unsigned char));
+        destinationBuffer = buffer;
+    } else {
+        destinationBuffer = remainingBuffer;
+    }
+    
     size_t dataOutMoved = 0;
-    CCCryptorStatus status = CCCryptorUpdate(backwardCryptor, fromBuffer, fromLength, toBuffer, toLength, &dataOutMoved);
+    CCCryptorStatus status = CCCryptorUpdate(backwardCryptor, fromBuffer, inputLen, destinationBuffer, requiredLength, &dataOutMoved);
     if (status != kCCSuccess) {
         if (error) {
             *error = [self errorForStatus:status];
         }
-        return NO;
+
+        goto finally;
     }
-    NSAssert(dataOutMoved <= toLength, @"Should be within buffer length: %i<=%i", dataOutMoved, toLength);
-    *fromInc = fromLength;
-    *toInc = dataOutMoved;
-    return YES;
+    
+    *fromInc = inputLen;
+    *toInc = dataOutMoved + originalToLength - toLength;
+    
+    retValue = YES;
+    
+    [self saveLeftovers:(destinationBuffer+dataOutMoved) fromLen:requiredLength toLen:toLength];
+    
+finally:
+    free(buffer);
+    free(tmpBuffer);
+    return retValue;
 }
 
 // turns bytes into zip (deflate)
@@ -119,10 +237,28 @@ static NSString * const NWIOStatusKey = @"status";
 }
 
 - (BOOL)flushBackwardToBuffer:(unsigned char *)toBuffer toLength:(NSUInteger)toLength toInc:(NSUInteger *)toInc error:(NSError **)error {
+    
+    *toInc = 0;
+    if(self.leftOverBuffer != 0) {
+        NSUInteger oldLen = toLength;
+        toBuffer = [self consumeLeftovers:toBuffer length:&toLength];
+        *toInc += oldLen - toLength;
+        
+        if(toLength == 0) {
+            return YES;
+        }
+    }
+    
     if (!backwardCryptor) {
-        *toInc = 0;
         return YES;
     }
+    
+    size_t requiredLength = CCCryptorGetOutputLength(backwardCryptor, 0, YES);
+    unsigned char * destBuf = toBuffer;
+    if(requiredLength > toLength) {
+        destBuf = malloc(requiredLength);
+    }
+    
     size_t dataOutMoved = 0;
     CCCryptorStatus status = CCCryptorFinal(backwardCryptor, toBuffer, toLength, &dataOutMoved);
     if (status != kCCSuccess) {
@@ -131,8 +267,14 @@ static NSString * const NWIOStatusKey = @"status";
         }
         return NO;
     }
+    *toInc += dataOutMoved;
     CCCryptorRelease(backwardCryptor); backwardCryptor = NULL;
-    *toInc = dataOutMoved;
+    
+    if(requiredLength > toLength) {
+        memcpy(toBuffer, destBuf, toLength);
+        [self saveLeftovers:toBuffer fromLen:requiredLength toLen:toLength];
+    }
+    
     return YES;
 }
 
@@ -155,6 +297,10 @@ static NSString * const NWIOStatusKey = @"status";
 }
 
 - (void)resetBackward {
+    free(self.leftOverBuffer);
+    self.leftOverBuffer = 0;
+    self.leftOverSize = 0;
+    
     if (backwardCryptor) {
         CCCryptorRelease(backwardCryptor); backwardCryptor = NULL;
     }
@@ -192,7 +338,7 @@ static NSString * const NWIOStatusKey = @"status";
 }
 
 - (void)setIv:(NSData *)iv {
-    [(NWIOCryptoTransform *)self.transform setKey:iv];
+    [(NWIOCryptoTransform *)self.transform setIv:iv];
 }
 
 @end

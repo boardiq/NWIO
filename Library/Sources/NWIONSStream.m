@@ -135,7 +135,7 @@
 }
 
 - (void)rewindRead {
-    NSAssert(NO, @"rewindRead not supported");
+    //NSAssert(NO, @"rewindRead not supported");
 }
 
 - (void)rewindWrite {
